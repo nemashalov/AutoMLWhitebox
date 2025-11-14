@@ -50,8 +50,22 @@ logger = get_logger(__name__)
 SplitType = Optional[Union[np.ndarray, List[float], Dict[int, int]]]
 
 
-def get_monotonic_constr(task: TaskType, name: str, train: pd.DataFrame, target: str, spec_values: Optional[List[Any]]):
-    """Check monotonic constraint."""
+def get_monotonic_constr(
+    task: TaskType, name: str, train: pd.DataFrame, target: str, spec_values: Optional[List[Any]]
+) -> str:
+    """Check monotonic constraint.
+
+    Args:
+        task: Task type (BIN or REG).
+        name: Feature name.
+        train: Training dataframe.
+        target: Target column name.
+        spec_values: List of special values to exclude.
+
+    Returns:
+        String representation of monotonic constraint: "-1", "0", or "1".
+
+    """
     df = train[[target, name]].dropna()
     if spec_values is not None:
         df = df.loc[~df[name].isin(spec_values)]
@@ -62,7 +76,6 @@ def get_monotonic_constr(task: TaskType, name: str, train: pd.DataFrame, target:
         elif task == TaskType.REG:
             corr = df[[target, name]].corr().iloc[0, 1]
             return str(int(np.sign(corr)))
-
     except (ValueError, TypeError, IndexError):
         return "0"
 
@@ -179,7 +192,7 @@ class AutoWoE:
 
     @property
     def intercept(self):
-        """Intercet."""
+        """Intercept."""
         return self._intercept
 
     @property
@@ -237,7 +250,7 @@ class AutoWoE:
 
         assert (
             mark_merge_to in EXTEND_OPTIONS_SPECIAL_VALUES
-        ), "Value for mari_merge_to is invalid. Valid are [{}]".format(EXTEND_OPTIONS_SPECIAL_VALUES)
+        ), "Value for mark_merge_to is invalid. Valid are [{}]".format(EXTEND_OPTIONS_SPECIAL_VALUES)
 
         self._params = {
             "task": task,
@@ -289,11 +302,11 @@ class AutoWoE:
 
         self.woe_dict = None
         self.train_df = None
-        self.split_dict = None  # словарь со сплитами для каждого признкака
-        self.target = None  # целевая переменная
-        self.clf = None  # модель лог регрессии
-        self.features_fit = None  # Признаки, которые прошли проверку Selector + информация о лучшей итерации Result
-        self._cv_split = None  # Словарь с индексами разбиения на train и test
+        self.split_dict = None  # Dictionary with splits for each feature
+        self.target = None  # Target variable
+        self.clf = None  # Logistic regression model
+        self.features_fit = None  # Features that passed Selector check + information about best iteration Result
+        self._cv_split = None  # Dictionary with indices for train and test split
         # self._small_nans = None
 
         self._private_features_type = None
@@ -468,9 +481,57 @@ class AutoWoE:
             features_mark_values,
         )
 
-        if group_kf:
-            group_kf = train[group_kf].values
+        group_kf_values = train[group_kf].values if group_kf else None
+        train_, max_bin_count, features_monotone_constraints = self._prepare_data_and_types(
+            train, target_name, group_kf_values
+        )
 
+        train_ = self._filter_features_by_nan(train_, target_name)
+        self._preprocess_target()
+        train_ = self._filter_features_by_importance(train_, target_name, features_mark_values)
+        train_, spec_values = self._process_special_values(train_)
+        self._cv_split = cv_split_f(
+            train_, self.target, self.params["task"], group_kf_values, n_splits=self.params["n_folds"]
+        )
+
+        split_dict = self._compute_woe_transforms(train_, target_name, max_bin_count, features_monotone_constraints)
+        self.split_dict = split_dict
+        self.train_df = self._train_encoding(train_, spec_values, self.params["oof_woe"])
+
+        best_features = self._perform_feature_selection(features_mark_values)
+        valid_enc, valid_target = self._prepare_validation_data(validation, target_name, best_features)
+
+        fit_result, _ = feature_changing(
+            self.feature_history,
+            "Pruned during regression refit",
+            self._private_features_type,
+            self._model_fit,
+            self.train_df,
+            best_features,
+            valid_enc,
+            valid_target,
+        )
+
+        self._store_fit_results(fit_result)
+
+        if not self.params["debug"]:
+            del self.train_df
+            del self.target
+
+    def _prepare_data_and_types(
+        self, train: pd.DataFrame, target_name: str, group_kf_values: Optional[np.ndarray]
+    ) -> Tuple[pd.DataFrame, Dict[str, int], Dict[str, str]]:
+        """Prepare data and handle feature types.
+
+        Args:
+            train: Training data.
+            target_name: Target column name.
+            group_kf_values: GroupKFold values if applicable.
+
+        Returns:
+            Prepared training data, max_bin_count dict, features_monotone_constraints dict.
+
+        """
         types_handler = TypesHandler(
             train=train,
             public_features_type=self._features_type,
@@ -491,7 +552,19 @@ class AutoWoE:
         self.target = train_[target_name]
         self.feature_history = {key: None for key in self.private_features_type.keys()}
 
-        # Remove columns with huge ratio of NaN-values
+        return train_, max_bin_count, features_monotone_constraints
+
+    def _filter_features_by_nan(self, train_: pd.DataFrame, target_name: str) -> pd.DataFrame:
+        """Remove columns with huge ratio of NaN-values.
+
+        Args:
+            train_: Training data.
+            target_name: Target column name.
+
+        Returns:
+            Filtered training data.
+
+        """
         train_, self._private_features_type = feature_changing(
             self.feature_history,
             "NaN values",
@@ -501,11 +574,22 @@ class AutoWoE:
             self.private_features_type,
             th_const=self.params["th_const"],
         )
+        return train_
 
-        # Target preprocessing
-        self._preprocess_target()
+    def _filter_features_by_importance(
+        self, train_: pd.DataFrame, target_name: str, features_mark_values: Optional[Dict[str, Tuple[Any]]]
+    ) -> pd.DataFrame:
+        """Remove features by model importance.
 
-        # Remove featuters by model importance
+        Args:
+            train_: Training data.
+            target_name: Target column name.
+            features_mark_values: Marked values dictionary.
+
+        Returns:
+            Filtered training data.
+
+        """
         train_, self._private_features_type = feature_changing(
             self.feature_history,
             "Low importance",
@@ -521,8 +605,18 @@ class AutoWoE:
             select_type=self.params["select_type"],
             process_num=self.params["n_jobs"],
         )
+        return train_
 
-        # Fill small group of category features, NaN-values by tags
+    def _process_special_values(self, train_: pd.DataFrame) -> Tuple[pd.DataFrame, Dict]:
+        """Fill small group of category features, NaN-values by tags.
+
+        Args:
+            train_: Training data.
+
+        Returns:
+            Processed training data and special values dictionary.
+
+        """
         self._features_special_values = FeatureSpecialValues(
             th_nan=self.params["th_nan"],
             th_cat=self.params["th_cat"],
@@ -534,9 +628,27 @@ class AutoWoE:
         train_, spec_values = self._features_special_values.fit_transform(
             train=train_, features_type=self.private_features_type
         )
+        return train_, spec_values
 
-        self._cv_split = cv_split_f(train_, self.target, self.params["task"], group_kf, n_splits=self.params["n_folds"])
+    def _compute_woe_transforms(
+        self,
+        train_: pd.DataFrame,
+        target_name: str,
+        max_bin_count: Dict[str, int],
+        features_monotone_constraints: Dict[str, str],
+    ) -> Dict[str, SplitType]:
+        """Compute WoE transformations for all features.
 
+        Args:
+            train_: Training data.
+            target_name: Target column name.
+            max_bin_count: Maximum bin count per feature.
+            features_monotone_constraints: Monotonic constraints per feature.
+
+        Returns:
+            Dictionary mapping feature names to their splits.
+
+        """
         params_gen = (
             (
                 x,
@@ -569,9 +681,20 @@ class AutoWoE:
         )
 
         logger.info(f"{split_dict.keys()} to selector !!!!!")
-        self.split_dict = split_dict  # набор пар признаки - границы бинов
-        self.train_df = self._train_encoding(train_, spec_values, self.params["oof_woe"])
+        return split_dict
 
+    def _perform_feature_selection(
+        self, features_mark_values: Optional[Dict[str, Tuple[Any]]]
+    ) -> List[str]:
+        """Perform feature selection using Selector.
+
+        Args:
+            features_mark_values: Marked values dictionary.
+
+        Returns:
+            List of selected feature names.
+
+        """
         logger.info("Feature selection...")
         selector = Selector(
             interpreted_model=self.params["interpreted_model"],
@@ -593,33 +716,40 @@ class AutoWoE:
             l1_exp_scale=self.params["l1_exp_scale"],
             metric_tol=self.params["metric_tol"],
         )
+        return best_features
 
-        # create validation data if it's defined and usefull
+    def _prepare_validation_data(
+        self, validation: Optional[pd.DataFrame], target_name: str, best_features: List[str]
+    ) -> Tuple[Optional[pd.DataFrame], Optional[pd.Series]]:
+        """Prepare validation data if available and useful.
+
+        Args:
+            validation: Validation dataframe.
+            target_name: Target column name.
+            best_features: Selected features.
+
+        Returns:
+            Encoded validation features and validation target.
+
+        """
         valid_enc, valid_target = None, None
         if validation is not None and not self.params["regularized_refit"]:
             valid_enc = self.test_encoding(validation, best_features)
             valid_target = validation[target_name]
+        return valid_enc, valid_target
 
-        fit_result, _ = feature_changing(
-            self.feature_history,
-            "Pruned during regression refit",
-            self._private_features_type,
-            self._model_fit,
-            self.train_df,
-            best_features,
-            valid_enc,
-            valid_target,
-        )
+    def _store_fit_results(self, fit_result: Dict):
+        """Store fit results in instance attributes.
 
+        Args:
+            fit_result: Dictionary containing fit results.
+
+        """
         for p in [("features_fit", False), ("weights", True), ("intercept", True), ("b_vars", True), ("p_vals", True)]:
             nm, is_private = p
             attr_name = "{}{}".format("_" * is_private, nm)
             if nm in fit_result:
                 setattr(self, attr_name, fit_result[nm])
-
-        if not self.params["debug"]:
-            del self.train_df
-            del self.target
 
     def feature_woe_transform(
         self,
@@ -630,64 +760,154 @@ class AutoWoE:
         max_bin_count: int,
         cat_alpha: float = 1.0,
     ) -> SplitType:
-        """Transformation WoE.
+        """Transform feature using WoE.
 
         Args:
             feature_name: Feature column name.
             train_df: Train dataset.
-            task: Task.
-            features_monotone_constraints: Feature mononotic contr.
+            task: Task type.
+            features_monotone_constraints: Feature monotonic constraints.
             max_bin_count: Maximum bin counts.
-            cat_alpha: Alpha.
+            cat_alpha: Alpha parameter for categorical encoding.
 
         Returns:
-            Transformed feature.
+            Transformed feature splits.
 
         """
         train_df = train_df.reset_index(drop=True)
         logger.info(f"{feature_name} processing...")
         target_name = train_df.columns[1]
-        # Откидываем здесь закодированные маленькие категории/наны. Их не учитываем при определения бинов
+
+        nan_index = self._get_special_values_indices(train_df, feature_name)
+        train_df, cat_enc = self._apply_categorical_encoding(train_df, feature_name, nan_index, cat_alpha)
+        train_df = self._remove_special_values(train_df, nan_index)
+        train_df = self._convert_dtypes(train_df, feature_name, target_name)
+
+        if train_df.shape[0] == 0:
+            return self._handle_empty_dataframe(feature_name, cat_enc)
+
+        tree_dict_opt = self._prepare_tree_params(max_bin_count, train_df, feature_name)
+        split = self._compute_optimal_split(
+            train_df, feature_name, target_name, task, features_monotone_constraints, tree_dict_opt
+        )
+
+        return self._reverse_categorical_encoding(feature_name, split, cat_enc)
+
+    def _get_special_values_indices(self, train_df: pd.DataFrame, feature_name: str) -> np.ndarray:
+        """Get indices of special values (NaN, small categories, marked values).
+
+        Args:
+            train_df: Training dataframe.
+            feature_name: Feature name.
+
+        Returns:
+            Array of indices for special values.
+
+        """
         if np.issubdtype(train_df.dtypes[feature_name], np.number):
-            nan_index = []
-        else:
-            sn_set = deepcopy(
-                CATEGORY_SPECIAL_SET if self.private_features_type[feature_name] == "cat" else REAL_SPECIAL_SET
-            )
+            return np.array([])
 
-            if self._features_mark_values is not None and feature_name in self._features_mark_values:
-                if self.private_features_type[feature_name] != "cat":
-                    sn_set.remove("__Mark__")
-                sn_set = sn_set.union({"__Mark__{}__".format(val) for val in self._features_mark_values[feature_name]})
+        sn_set = deepcopy(
+            CATEGORY_SPECIAL_SET if self.private_features_type[feature_name] == "cat" else REAL_SPECIAL_SET
+        )
 
-            nan_index = train_df[feature_name].isin(sn_set)
-            nan_index = np.where(nan_index.values)[0]
+        if self._features_mark_values is not None and feature_name in self._features_mark_values:
+            if self.private_features_type[feature_name] != "cat":
+                sn_set.remove("__Mark__")
+            sn_set = sn_set.union({"__Mark__{}__".format(val) for val in self._features_mark_values[feature_name]})
 
-        cat_enc = None
+        nan_mask = train_df[feature_name].isin(sn_set)
+        return np.where(nan_mask.values)[0]
+
+    def _apply_categorical_encoding(
+        self, train_df: pd.DataFrame, feature_name: str, nan_index: np.ndarray, cat_alpha: float
+    ) -> Tuple[pd.DataFrame, Optional[CatEncoding]]:
+        """Apply categorical encoding if feature is categorical.
+
+        Args:
+            train_df: Training dataframe.
+            feature_name: Feature name.
+            nan_index: Indices of special values.
+            cat_alpha: Alpha parameter for encoding.
+
+        Returns:
+            Tuple of (encoded dataframe, CatEncoding object if categorical, None otherwise).
+
+        """
         if self.private_features_type[feature_name] == "cat":
             cat_enc = CatEncoding(data=train_df)
             train_df = cat_enc(self._cv_split, nan_index, cat_alpha)
+            return train_df, cat_enc
+        return train_df, None
 
-        train_df = train_df.iloc[np.setdiff1d(np.arange(train_df.shape[0]), nan_index), :]
+    def _remove_special_values(self, train_df: pd.DataFrame, nan_index: np.ndarray) -> pd.DataFrame:
+        """Remove rows with special values from dataframe.
 
+        Args:
+            train_df: Training dataframe.
+            nan_index: Indices of special values to remove.
+
+        Returns:
+            Filtered dataframe.
+
+        """
+        valid_indices = np.setdiff1d(np.arange(train_df.shape[0]), nan_index)
+        return train_df.iloc[valid_indices, :]
+
+    def _convert_dtypes(self, train_df: pd.DataFrame, feature_name: str, target_name: str) -> pd.DataFrame:
+        """Convert data types for LightGBM compatibility.
+
+        Args:
+            train_df: Training dataframe.
+            feature_name: Feature name.
+            target_name: Target column name.
+
+        Returns:
+            Dataframe with converted types.
+
+        """
         if self.params["task"] == TaskType.BIN:
-            train_df = train_df.astype({feature_name: float, target_name: int})
+            return train_df.astype({feature_name: float, target_name: int})
         else:
-            train_df = train_df.astype({feature_name: float, target_name: float})
-        # нужный тип для lgb после нанов и маленьких категорий
-        if train_df.shape[0] == 0:  # случай, если кроме нанов и маленьких категорий ничего не осталось
-            split = [-np.inf]
-            if self.private_features_type[feature_name] == "cat":
-                return cat_enc.mean_target_reverse(split)
-            elif self.private_features_type[feature_name] == "real":
-                return split
-            else:
-                raise ValueError("self.features_type[feature] is cat or real")
+            return train_df.astype({feature_name: float, target_name: float})
 
-        # подбор оптимальных параметров дерева
+    def _handle_empty_dataframe(self, feature_name: str, cat_enc: Optional[CatEncoding]) -> SplitType:
+        """Handle case when dataframe is empty after removing special values.
+
+        Args:
+            feature_name: Feature name.
+            cat_enc: Categorical encoding object if applicable.
+
+        Returns:
+            Default split for empty data.
+
+        """
+        split = [-np.inf]
+        if self.private_features_type[feature_name] == "cat":
+            if cat_enc is None:
+                raise ValueError("cat_enc is None for categorical feature")
+            return cat_enc.mean_target_reverse(split)
+        elif self.private_features_type[feature_name] == "real":
+            return split
+        else:
+            raise ValueError(f"Feature type {self.private_features_type[feature_name]} is not supported")
+
+    def _prepare_tree_params(
+        self, max_bin_count: int, train_df: pd.DataFrame, feature_name: str
+    ) -> OrderedDict:
+        """Prepare tree parameters for optimization.
+
+        Args:
+            max_bin_count: Maximum number of bins.
+            train_df: Training dataframe.
+            feature_name: Feature name.
+
+        Returns:
+            Dictionary of tree parameters.
+
+        """
         tree_dict_opt = deepcopy(self._tree_dict_opt)
-        if max_bin_count:  # ограничение на число бинов
-
+        if max_bin_count:
             leaves_range = tuple(range(2, max_bin_count + 1))
             tree_dict_opt = OrderedDict(
                 {
@@ -696,7 +916,6 @@ class AutoWoE:
                 }
             )
 
-            # Еще фича force_single_split ..
             if self.params["force_single_split"]:
                 min_size = train_df.shape[0] - train_df[feature_name].value_counts(dropna=False).values[0]
                 if self.params["th_const"] < min_size < self.params["min_bin_size"]:
@@ -704,6 +923,31 @@ class AutoWoE:
                     tree_dict_opt["min_data_in_bin"] = [3]
                     tree_dict_opt["num_leaves"] = [2]
 
+        return tree_dict_opt
+
+    def _compute_optimal_split(
+        self,
+        train_df: pd.DataFrame,
+        feature_name: str,
+        target_name: str,
+        task: TaskType,
+        features_monotone_constraints: str,
+        tree_dict_opt: OrderedDict,
+    ) -> SplitType:
+        """Compute optimal split using tree optimization and homotopy transform.
+
+        Args:
+            train_df: Training dataframe.
+            feature_name: Feature name.
+            target_name: Target column name.
+            task: Task type.
+            features_monotone_constraints: Monotonic constraints.
+            tree_dict_opt: Tree optimization parameters.
+
+        Returns:
+            Optimal split.
+
+        """
         tree_opt = TreeParamOptimizer(
             data=train_df,
             task=task,
@@ -713,29 +957,31 @@ class AutoWoE:
             ),
         )
         tree_param = tree_opt(3)
-        # значение monotone_constraints содержится в tree_params
-        # подбор подходяшего сплита на бины
         htransform = HTransform(self._params["task"], train_df[feature_name], train_df[target_name])
-        split = htransform(tree_param)
+        return htransform(tree_param)
 
-        #  Обратная операция к mean_target_encoding
+    def _reverse_categorical_encoding(
+        self, feature_name: str, split: SplitType, cat_enc: Optional[CatEncoding]
+    ) -> SplitType:
+        """Reverse categorical encoding if applicable.
+
+        Args:
+            feature_name: Feature name.
+            split: Computed split.
+            cat_enc: Categorical encoding object.
+
+        Returns:
+            Final split after reverse encoding.
+
+        """
         if self.private_features_type[feature_name] == "cat":
+            if cat_enc is None:
+                raise ValueError("cat_enc is None for categorical feature")
             return cat_enc.mean_target_reverse(split)
         elif self.private_features_type[feature_name] == "real":
             return split
         else:
-            raise ValueError("self.features_type[feature] is cat or real")
-
-    def _get_task_type(values: np.ndarray) -> TaskType:
-        n_unique_values = np.unique(values).shape[0]
-        if n_unique_values == 1:
-            raise RuntimeError("Only unique value in target")
-        elif n_unique_values == 2:
-            task = TaskType.BIN
-        else:
-            task = TaskType.REG
-
-        return task
+            raise ValueError(f"Feature type {self.private_features_type[feature_name]} is not supported")
 
     def _preprocess_target(self):
         if self.params["task"] == TaskType.REG:
@@ -745,8 +991,18 @@ class AutoWoE:
             self._target_std = self._target_scaler.mean_[0]
             self._target_mean = self._target_scaler.scale_[0]
 
-    def _train_encoding(self, train: pd.DataFrame, spec_values: Dict, folds_codding: bool) -> pd.DataFrame:  # TODO: ref
-        """Encode a train dataset based on WoE estimates."""
+    def _train_encoding(self, train: pd.DataFrame, spec_values: Dict, folds_codding: bool) -> pd.DataFrame:
+        """Encode a train dataset based on WoE estimates.
+
+        Args:
+            train: Training dataframe.
+            spec_values: Dictionary of special values per feature.
+            folds_codding: Whether to use cross-validation encoding.
+
+        Returns:
+            Encoded training dataframe.
+
+        """
         woe_dict = dict()
         woe_list = []
         for feature in self.private_features_type:
@@ -915,34 +1171,38 @@ class AutoWoE:
 
         return lin_pred
 
-    def get_model_represenation(self):
-        """Get scorecard.
+    def get_model_representation(self):
+        """Get scorecard representation of the model.
 
         Returns:
-            scorecard.
+            Dictionary containing scorecard representation with features and intercept.
 
         """
         features = list(self.features_fit.index)
-        result = dict()
+        result = {}
         for feature in features:
-            feature_data = dict()
+            feature_data = {}
             woe = self.woe_dict[feature]
             feature_data["f_type"] = woe.f_type
 
             if woe.f_type == "real":
-                feature_data["splits"] = [0 + round(float(x), 6) for x in woe.split]
+                feature_data["splits"] = [round(float(x), 6) for x in woe.split]
             else:
                 feature_data["cat_map"] = {str(k): int(v) for k, v in woe.split.items()}
                 spec_vals = self._features_special_values.cat_encoding[feature]
                 feature_data["spec_cat"] = (spec_vals[0], spec_vals[2])
 
             feature_data["cod_dict"] = {
-                int(k): (0 + round(float(v), 6)) for k, v in woe.cod_dict.items() if type(k) is int or type(k) is float
+                int(k): round(float(v), 6)
+                for k, v in woe.cod_dict.items()
+                if isinstance(k, (int, float))
             }
 
             feature_data["weight"] = float(self.features_fit[feature])
             feature_data["nan_value"] = self._features_special_values.all_encoding[feature]
-            feature_data["spec_cod"] = {k: (0 + round(float(v), 6)) for k, v in woe.cod_dict.items() if type(k) is str}
+            feature_data["spec_cod"] = {
+                k: round(float(v), 6) for k, v in woe.cod_dict.items() if isinstance(k, str)
+            }
             if self._features_mark_values is not None and feature in self._features_mark_values:
                 feature_data["mark_values"] = self._features_mark_values[feature]
                 feature_data["mark_encoding"] = self._features_special_values.mark_encoding[feature]
@@ -950,6 +1210,15 @@ class AutoWoE:
             result[feature] = feature_data
 
         return {"features": result, "intercept": float(self.intercept)}
+
+    def get_model_represenation(self):
+        """Get scorecard representation (deprecated, use get_model_representation).
+
+        Returns:
+            Dictionary containing scorecard representation with features and intercept.
+
+        """
+        return self.get_model_representation()
 
     def get_sql_inference_query(
         self,
